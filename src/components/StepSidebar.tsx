@@ -68,9 +68,23 @@ export function StepSidebar({ steps, activeStepIndex, onSelectStep }: StepSideba
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium truncate">{step.name}</div>
                 <div className="flex items-center gap-2 mt-0.5">
-                  <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                    {step.type === 'manual' ? 'Manual' : 'Auto'}
-                  </span>
+                  {step.status === 'running' ? (
+                    <span className={`text-[10px] font-semibold uppercase tracking-wider ${step.type === 'manual' ? 'text-warning' : 'text-primary'}`}>
+                      {step.type === 'manual' ? 'Awaiting Action' : 'Processing...'}
+                    </span>
+                  ) : step.status === 'completed' ? (
+                    <span className="text-[10px] font-semibold uppercase tracking-wider text-success">
+                      Done
+                    </span>
+                  ) : step.status === 'error' ? (
+                    <span className="text-[10px] font-semibold uppercase tracking-wider text-destructive">
+                      Error
+                    </span>
+                  ) : (
+                    <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                      {step.type === 'manual' ? 'Manual' : 'Auto'}
+                    </span>
+                  )}
                   {(step.status === 'completed' || step.status === 'running') && (
                     <span className="text-[10px] font-mono text-muted-foreground">
                       {formatTime(step.elapsedMs)}
