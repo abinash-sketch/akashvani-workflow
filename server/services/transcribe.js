@@ -22,10 +22,11 @@
  *   4. Emit SRT cues at HH:MM:SS,mmm precision, splitting long transcripts
  *      into sentence/clause cues with time shared out by text length.
  *
- * This is a direct port of the Python prototype in test-sarvam-models/, kept
- * deliberately parameter-for-parameter identical so output that was reviewed
- * and approved there is what the app produces here. Resist "improving" the
- * constants below without re-checking a real episode.
+ * Started as a direct port of the Python prototype in test-sarvam-models/,
+ * parameter-for-parameter identical. The SEGMENTATION constants still match it.
+ * The CUE SHAPING constants no longer do: they were re-tuned against a Premiere
+ * Pro reference caption of the same speech (see MAX_CUE_CHARS below). Re-check
+ * a real episode before changing either group.
  */
 
 import { spawn } from 'child_process';
@@ -55,8 +56,48 @@ const MERGE_MAX = 5.0;         // ...but never grow a merged segment past this
 const HARD_MAX = 29.0;         // REST endpoint caps at 30 s — force-split above this
 const MIN_SEG = 0.25;          // drop blips shorter than this
 
+// ── micro-pause detection (cue boundaries only) ─────────────────────────────
+// The constants above decide what gets SENT to the API, and must stay coarse:
+// a segment needs enough context to transcribe well, and more segments means
+// more calls. But a pause has to be ~0.5 s to survive them (0.20 s to be seen
+// at all, then SEG_PAD eats 0.20 s, then MERGE_GAP closes anything under
+// 0.30 s), and in the Premiere Pro reference only 11% of cue boundaries have a
+// gap that big — half sit in the 0.05–0.10 s band. So we run a second, far more
+// sensitive pass purely to find candidate CUT POINTS inside a segment we have
+// already transcribed. It costs one more ffmpeg pass and no API calls.
+// Swept on the extracted WAV against reference captions of two real episodes.
+//
+//   Clean studio audio: agreement with the reference's cue boundaries
+//   (±150 ms) was 30.0% unsnapped, and peaks on a plateau from -40 to -45 dB
+//   at 40.5%. Looser is actively worse — at -30 dB the 1059 "pauses" found are
+//   mostly noise and agreement falls to 29.5%.
+//
+//   A 1999 broadcast recording: snapping does not help AT ALL. Unsnapped
+//   agreement is 50.2% and no threshold beats it; the tape noise floor means
+//   -35 dB reports a "pause" every half second that has nothing to do with
+//   speech. Pre-filtering (highpass+lowpass+afftdn) made it worse still, ~48%.
+//
+// -40 dB is what makes that second case harmless rather than damaging: it
+// finds only 26 pauses in 26 minutes of that recording, so snapping degrades
+// to the character estimate instead of chasing noise. Note there is no runtime
+// signal that tells the two cases apart — pause DENSITY does not, since the
+// noisy file at -35 dB is sparser (0.90/s) than the clean one at its best
+// setting (1.07/s) and still hurts. So resist making this adaptive without
+// evidence; strictness is the only protection we have.
+export const MICRO_NOISE = '-40dB';
+export const MICRO_MIN = 0.04; // 40 ms — short enough to catch a breath
+const SNAP_WINDOW = 0.70;      // never move a cut further than this to reach one
+const SNAP_FRACTION = 0.45;    // ...nor by more than this much of the shorter side
+
 // ── cue shaping ─────────────────────────────────────────────────────────────
-const MAX_CUE_CHARS = 42;      // single-line phrase cues
+// Ceilings measured off a Premiere Pro reference caption of the same speech
+// (713 cues): PP never exceeds 35 characters or 3.36 s. Ours allowed 42 chars
+// and had no duration limit at all, so a short line spoken slowly across pauses
+// we had merged away sat on screen for 9 s. Both limits now bind.
+const MAX_CUE_CHARS = 35;      // single-line phrase cues
+const MAX_CUE_DURATION = 3.5;  // no cue stays up longer than this if it can be split
+const MIN_CUE_CHARS = 12;      // floor on the duration-derived budget, so a long
+                               // near-silent segment isn't shredded word by word
 const MIN_CUE_DURATION = 0.5;  // pad ultra-short cues so they stay readable
 
 /** Labels the model hallucinates over music beds and room noise. */
@@ -154,10 +195,10 @@ async function extractAudio(video, outWav) {
 }
 
 /** Silence intervals as [[start, end], ...], via ffmpeg's silencedetect. */
-async function detectSilences(wav) {
+export async function detectSilences(wav, noise = SILENCE_NOISE, minDuration = SILENCE_MIN) {
   const { stderr } = await run(FFMPEG_BIN, [
     '-i', wav,
-    '-af', `silencedetect=noise=${SILENCE_NOISE}:d=${SILENCE_MIN}`,
+    '-af', `silencedetect=noise=${noise}:d=${minDuration}`,
     '-f', 'null', '-',
   ]);
   const starts = [...stderr.matchAll(/silence_start:\s*([\d.]+)/g)].map((m) => parseFloat(m[1]));
@@ -280,30 +321,97 @@ const SENTENCE_SPLIT = /(?<=[।.?!])\s+/;
 const CLAUSE_SPLIT = /(?<=[,;])\s+/;
 
 /**
- * Break text into the smallest natural units: sentences, then clauses, then
- * balanced halves for anything still over MAX_CUE_CHARS.
+ * Hindi words that bind to the word BEFORE them — postpositions, auxiliaries
+ * and case markers. Starting a cue with one of these reads as a broken phrase,
+ * so a cut just before them is penalised.
  */
-export function splitUnits(text) {
+const BINDS_LEFT = new Set([
+  'का', 'के', 'की', 'को', 'में', 'से', 'पर', 'ने', 'तक', 'लिए', 'द्वारा', 'साथ',
+  'वाला', 'वाले', 'वाली', 'ही', 'भी', 'तो', 'है', 'हैं', 'था', 'थे', 'थी', 'हूँ',
+  'हो', 'होगा', 'होगी', 'होंगे', 'गया', 'गई', 'गए', 'रहा', 'रही', 'रहे', 'कर',
+  'करके', 'चुका', 'चुकी', 'सकता', 'सकती', 'सकते', 'नहीं',
+]);
+
+/**
+ * Hindi words that bind to the word AFTER them — determiners, conjunctions and
+ * quantifiers. Ending a cue on one of these leaves the phrase hanging.
+ */
+const BINDS_RIGHT = new Set([
+  'और', 'या', 'कि', 'जो', 'लेकिन', 'परंतु', 'क्योंकि', 'इस', 'उस', 'यह', 'वह',
+  'ये', 'वो', 'एक', 'अपने', 'अपनी', 'अपना', 'मेरे', 'मेरी', 'हमारे', 'हमारी',
+  'बहुत', 'कुछ', 'हर', 'सभी', 'किसी', 'किस', 'जिस',
+]);
+
+const stripPunct = (w) => (w || '').replace(/[।,.?!;:"'()]/g, '');
+
+/**
+ * Choose where to cut a run of words that is over budget.
+ *
+ * Every space is a candidate. We prefer a cut that leaves balanced halves, and
+ * penalise one that would strand a bound word at either edge. Without this the
+ * splitter cut at the nearest space to the midpoint and produced breaks like
+ * "...हम सबके | लिए विशेष महत्व रखता है।", which splits a noun from its
+ * postposition.
+ *
+ * Returns the index of the space to cut at, or -1 if there is none.
+ */
+export function bestCut(text) {
+  const spaces = [];
+  for (let i = text.indexOf(' '); i !== -1; i = text.indexOf(' ', i + 1)) spaces.push(i);
+  if (!spaces.length) return -1;
+
+  const mid = text.length / 2;
+  let best = -1;
+  let bestScore = Infinity;
+  for (const i of spaces) {
+    const left = text.slice(0, i);
+    const right = text.slice(i + 1);
+    if (!left.trim() || !right.trim()) continue;
+
+    // imbalance, normalised so it stays comparable to the penalties below
+    let score = Math.abs(i - mid) / mid;
+    const prev = stripPunct(left.split(' ').pop());
+    const next = stripPunct(right.split(' ')[0]);
+    if (BINDS_LEFT.has(next)) score += 1.0;   // cue would START with के/लिए/में...
+    if (BINDS_RIGHT.has(prev)) score += 1.0;  // cue would END with इस/यह/और/कि...
+    if (/[।.?!]$/.test(left)) score -= 0.6;   // sentence end: the best cut there is
+    else if (/[,;:]$/.test(left)) score -= 0.3;
+
+    if (score < bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/**
+ * Break text into the smallest natural units: sentences, then clauses, then
+ * phrase-aware halves for anything still over `budget`.
+ *
+ * `budget` is normally MAX_CUE_CHARS, but segmentToCues lowers it when the
+ * segment is slow, so that a long quiet stretch produces several short cues
+ * instead of one that sits on screen for nine seconds.
+ */
+export function splitUnits(text, budget = MAX_CUE_CHARS) {
+  const limit = Math.max(1, budget);
   const units = [];
   for (const rawSent of text.split(SENTENCE_SPLIT)) {
     const sent = rawSent.trim();
     if (!sent) continue;
-    const parts = sent.length <= MAX_CUE_CHARS ? [sent] : sent.split(CLAUSE_SPLIT);
+    const parts = sent.length <= limit ? [sent] : sent.split(CLAUSE_SPLIT);
     for (const rawPart of parts) {
       const part = rawPart.trim();
       if (!part) continue;
-      // word-level fallback: halve at the space nearest the middle until it fits
+      // word-level fallback: halve at the best available space until it fits
       const stack = [part];
       while (stack.length) {
         const p = stack.shift();
-        if (p.length <= MAX_CUE_CHARS || !p.includes(' ')) {
+        const cut = p.length <= limit ? -1 : bestCut(p);
+        if (cut === -1) {
           units.push(p);
           continue;
         }
-        const mid = Math.floor(p.length / 2);
-        const left = p.lastIndexOf(' ', mid);
-        const right = p.indexOf(' ', mid);
-        const cut = left !== -1 && (right === -1 || mid - left <= right - mid) ? left : right;
         stack.unshift(p.slice(0, cut).trim(), p.slice(cut + 1).trim());
       }
     }
@@ -317,26 +425,48 @@ function isJunk(text) {
 }
 
 /**
+ * Characters a cue may hold in this segment.
+ *
+ * Both ceilings have to bind at once, and the duration ceiling is a limit on
+ * TIME, not text — so convert it to characters using this segment's own
+ * speaking rate. A segment of 42 characters over 10 s runs at 0.24 s/char, so
+ * 3.5 s of screen time is ~14 characters, and the segment becomes four cues
+ * rather than one. MIN_CUE_CHARS stops a near-silent segment (little text,
+ * lots of time) from being shredded a word at a time.
+ */
+function cueBudget(start, end, textLength) {
+  const duration = end - start;
+  if (!(duration > 0) || !textLength) return MAX_CUE_CHARS;
+  const secPerChar = duration / textLength;
+  const byDuration = Math.floor(MAX_CUE_DURATION / secPerChar);
+  return Math.max(MIN_CUE_CHARS, Math.min(MAX_CUE_CHARS, byDuration));
+}
+
+/**
  * One speech segment becomes one or more cues.
  *
  * Short segments map 1:1, and their timing is exact — straight off the silence
- * boundaries. A long transcript is split into natural units and the segment's
- * duration shared out by character count, which is an estimate within that
- * segment but never drifts beyond it.
+ * boundaries. Anything over either ceiling is split into natural units and the
+ * segment's duration shared out by character count, then each internal cut is
+ * moved onto the nearest micro-pause in `pauses`, so the boundary lands where
+ * the speaker actually stopped instead of where the character count guessed.
+ * Without `pauses` the character estimate stands.
  */
-export function segmentToCues(start, end, transcript) {
+export function segmentToCues(start, end, transcript, pauses = []) {
   const text = (transcript || '').trim();
   if (!text || isJunk(text)) return [];
-  if (text.length <= MAX_CUE_CHARS) return [{ start, end, text }];
 
-  const units = splitUnits(text);
+  const budget = cueBudget(start, end, text.length);
+  if (text.length <= budget) return [{ start, end, text }];
+
+  const units = splitUnits(text, budget);
 
   // pack units back up into cue-sized pieces
   const pieces = [];
   let current = '';
   for (const unit of units) {
     const candidate = `${current} ${unit}`.trim();
-    if (current && candidate.length > MAX_CUE_CHARS) {
+    if (current && candidate.length > budget) {
       pieces.push(current);
       current = unit;
     } else {
@@ -347,15 +477,67 @@ export function segmentToCues(start, end, transcript) {
 
   const totalChars = pieces.reduce((n, p) => n + p.length, 0);
   const duration = end - start;
-  const cues = [];
+
+  // Estimate each internal boundary by sharing the segment's duration out by
+  // character count, then move it onto a real pause where there is one.
+  const boundaries = [];
   let cursor = start;
-  pieces.forEach((piece, i) => {
-    const share = (duration * piece.length) / totalChars;
-    const cueEnd = i === pieces.length - 1 ? end : cursor + share;
-    cues.push({ start: cursor, end: cueEnd, text: piece });
-    cursor = cueEnd;
-  });
-  return cues;
+  for (let i = 0; i < pieces.length - 1; i++) {
+    cursor += (duration * pieces[i].length) / totalChars;
+    boundaries.push(cursor);
+  }
+  const snapped = snapCuts(boundaries, midpointsWithin(pauses, start, end), start, end);
+
+  return pieces.map((text, i) => ({
+    start: i === 0 ? start : snapped[i - 1],
+    end: i === pieces.length - 1 ? end : snapped[i],
+    text,
+  }));
+}
+
+/** Midpoints of the pauses that fall inside [lo, hi]. `pauses` is sorted. */
+export function midpointsWithin(pauses, lo, hi) {
+  const out = [];
+  for (const [s, e] of pauses) {
+    if (e <= lo) continue;
+    if (s >= hi) break;
+    out.push((Math.max(s, lo) + Math.min(e, hi)) / 2);
+  }
+  return out;
+}
+
+/**
+ * Move each estimated cut onto the nearest real pause.
+ *
+ * A cut is only allowed to move so far: SNAP_WINDOW in absolute terms, and
+ * never more than SNAP_FRACTION of the shorter side, so a cue can't be pulled
+ * past its neighbour or collapsed to nothing. Cuts stay strictly increasing —
+ * each one is placed after the one before it, so a snap can never reorder them.
+ * With no pauses in range the estimate is kept, which is the old behaviour.
+ */
+export function snapCuts(cuts, pauseMids, lo, hi) {
+  const out = [];
+  for (let i = 0; i < cuts.length; i++) {
+    const t = cuts[i];
+    const prev = i === 0 ? lo : out[i - 1];
+    const next = i === cuts.length - 1 ? hi : cuts[i + 1];
+    const room = Math.min(t - prev, next - t);
+    const allowance = Math.min(SNAP_WINDOW, Math.max(0, room) * SNAP_FRACTION);
+
+    let best = t;
+    let bestDist = allowance;
+    for (const mid of pauseMids) {
+      if (mid <= prev) continue;
+      if (mid >= next) break;
+      const dist = Math.abs(mid - t);
+      if (dist <= bestDist) {
+        bestDist = dist;
+        best = mid;
+      }
+    }
+    out.push(Math.min(Math.max(best, prev), next));
+  }
+  return out;
 }
 
 /** SRT timestamp with millisecond precision: HH:MM:SS,mmm */
@@ -469,6 +651,12 @@ export async function generateSrtForVideo(videoPath, outSrtPath, opts = {}) {
     if (!segments.length) {
       throw new Error('No speech found in this video — nothing to transcribe.');
     }
+
+    // Second, much more sensitive pass. These are not segment boundaries and
+    // are never sent to the API — they are the candidate cut points used when
+    // a segment has to become more than one cue.
+    const pauses = await detectSilences(fullWav, MICRO_NOISE, MICRO_MIN);
+    onLog(`${segments.length} speech segments, ${pauses.length} micro-pauses for cue boundaries`);
     const speech = segments.reduce((n, [s, e]) => n + (e - s), 0);
     onLog(`${silences.length} silences → ${segments.length} speech segments (${Math.round(speech)}s of speech)`);
     onProgress(15);
@@ -530,7 +718,7 @@ export async function generateSrtForVideo(videoPath, outSrtPath, opts = {}) {
     const cues = [];
     results.forEach((payload, i) => {
       if (!payload) return;
-      cues.push(...segmentToCues(segments[i][0], segments[i][1], payload.transcript || ''));
+      cues.push(...segmentToCues(segments[i][0], segments[i][1], payload.transcript || '', pauses));
     });
     if (!cues.length) {
       throw new Error('Transcription returned no usable text for this video.');

@@ -222,6 +222,41 @@ taken from **silences detected by FFmpeg** instead: the audio is cut at the paus
 speech segment is transcribed on its own, and the segment's measured start/end becomes
 the cue timing. Timings are therefore measured, not inferred.
 
+### Measuring cue quality
+
+Cue *text* is good; cue *timing* is the open problem. Two scripts score it, and neither
+costs an API call:
+
+```bash
+# Rebuild cues from a saved transcription and score against a reference caption
+node scripts/srt-compare.mjs <input.raw.json> [reference.srt] [media]
+
+# Can pauses be found in this recording at all? (the ceiling for any pause-based method)
+node scripts/pause-ceiling.mjs <video> <approved.srt>
+```
+
+Every transcription run saves a **`.raw.json` beside its SRT** holding the segment
+boundaries and each raw Sarvam response. That file is exactly the input to cue building,
+so cue logic can be re-run and re-scored indefinitely without re-transcribing anything.
+Transcribe an episode once, then iterate for free.
+
+Where it stands, measured against a Premiere Pro caption of the same 26-minute archival
+speech (713 cues) — *boundary agreement* is the share of reference cue starts we also
+place within 150 ms:
+
+| | cues | over 4 s | over 36 chars | boundary agreement |
+| --- | --- | --- | --- | --- |
+| before | 570 | 20 | 68 | 45.0% |
+| now | 672 | 0 | 0 | 50.2% |
+| Premiere Pro | 713 | 0 | 0 | — |
+
+The remaining gap is timing, and it is structural: a quarter of Premiere Pro's boundaries
+sit in continuous speech with no pause at all. Closing it needs word-level timing rather
+than silence detection. See the comments in
+[`transcribe.js`](server/services/transcribe.js) for what has already been ruled out —
+in particular, snapping cuts to finer pauses works well on clean studio audio and does
+nothing on noisy archival audio, which is what the editors actually work on.
+
 ### How Roman script works
 
 Punctuation is normalised deterministically, the dictionary's confirmed spellings are
